@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS tracks(
   audio_path TEXT,                   -- repo-relative 'audio/<artist>/<file>.mp3'
   size INTEGER, md5 TEXT, sha256 TEXT,
   dl_url TEXT,                       -- direct-download URL (Jamendo-style sources; NULL for FMA)
+  ia_item TEXT,                      -- IA item identifier this track landed in (set on IA upload)
   status TEXT NOT NULL DEFAULT 'PENDING',
   tries INTEGER DEFAULT 0, last_err TEXT,
   seq INTEGER NOT NULL DEFAULT 0
@@ -76,6 +77,10 @@ class Ledger:
         self._conn.execute("PRAGMA mmap_size=268435456")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # migration: older ledgers without the per-track IA item pointer
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tracks)")}
+            if "ia_item" not in cols:
+                self._conn.execute("ALTER TABLE tracks ADD COLUMN ia_item TEXT")
         # Monotonic, machine-independent seq: epoch-ms << 20 | 20-bit counter.
         self._base = int(time.time() * 1000) << 20
         self._i = 0
@@ -181,14 +186,30 @@ class Ledger:
                 [(STATUS_UPLOADED_HF, self._nseq(), k, STATUS_DOWNLOADED, STATUS_UPLOADED_IA) for k in keys],
             )
 
-    def mark_track_ia(self, keys: list[str]) -> None:
+    def mark_track_ia(self, keys: list[str], identifier: str) -> None:
         if not keys:
             return
         with self._lock, self._conn:
             self._conn.executemany(
-                "UPDATE tracks SET status=?, seq=? WHERE track_key=?",
-                [(STATUS_UPLOADED_IA, self._nseq(), k) for k in keys],
+                "UPDATE tracks SET status=?, ia_item=?, seq=? WHERE track_key=?",
+                [(STATUS_UPLOADED_IA, identifier, self._nseq(), k) for k in keys],
             )
+
+    def links_rows(self) -> list[dict]:
+        """All IA-archived tracks with their permanent download links — CSV snapshot source.
+
+        Cumulative: every track that has actually been uploaded to Internet Archive
+        keeps exactly one stable archive.org/download/<item>/<file> URL for life.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT track_key, title, artist, album, composer,
+                          audio_path, license_name, license_url, ia_item
+                   FROM tracks
+                   WHERE ia_item IS NOT NULL
+                   ORDER BY ia_item, title, track_key"""
+            )
+            return [dict(r) for r in cur.fetchall()]
 
     def tracks_to_extract(self, shard: str | None = None, limit: int | None = None) -> list[sqlite3.Row]:
         with self._lock:

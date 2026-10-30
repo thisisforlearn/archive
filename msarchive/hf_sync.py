@@ -268,10 +268,85 @@ license when re-using (e.g. CC-BY-SA share-alike chains still apply to derivativ
 
 `state/msarchive.db` is the SQLite progress ledger (per-track md5/sha256, source
 geometry). `state/stats.json` carries live counters of the archiver run.
+
+## Per-track Internet Archive download links
+
+Every track that has landed on Internet Archive keeps a permanent streaming/
+download URL: `archive.org/download/<IA item>/<file>`. Full per-track tables
+(title, display title, artist, album, composer, license, IA item, IA item URL,
+download URL) are snapshotted hourly in `links/`:
+`vaibhav-archive-music-download-links_001.csv`, `_002`, ... (a NEW numbered
+snapshot is added every checkpoint — previous snapshots are never overwritten,
+so every archived track always has a link in every file after its upload).
 """
         out = self.cfg.data_dir / "README.md"
         out.write_text(text, encoding="utf-8")
         return out
+
+    # --------------------------------------------------- hourly links CSV
+    LINKS_BASE = "vaibhav-archive-music-download-links"
+
+    def write_links_csv(self):
+        """Rotating, cumulative per-track download-link CSV.
+
+        Every checkpoint writes a NEW numbered file into links/ —
+        links/vaibhav-archive-music-download-links_001.csv, _002, _100, _1000 ...
+        (3-digit zero-pad, digits grow naturally past 999) — containing the FULL
+        snapshot of every track that has actually landed on Internet Archive,
+        with its permanent archive.org/download/<item>/<file> URL. Old files are
+        never overwritten: rotation is monotonic per ledger.
+        """
+        import csv as _csv
+        import os
+
+        from msarchive.aliases import aliases_for_row, styled_title
+        from msarchive.ia_upload import IaUploader
+
+        dest = self.cfg.data_dir / "links"
+        dest.mkdir(parents=True, exist_ok=True)
+        seq = int(self.ledger.get_meta("hf_links_seq", "0") or 0) + 1
+        path = dest / f"{self.LINKS_BASE}_{seq:03d}.csv"
+        tmp = path.with_name(path.name + ".tmp")
+        rows = self.ledger.links_rows()
+        n = 0
+        try:
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
+                w = _csv.writer(f)
+                w.writerow(("title", "display_title", "artist", "album", "composer",
+                            "file", "license", "license_url",
+                            "ia_item", "ia_item_url", "download_url"))
+                for r in rows:
+                    if not r.get("ia_item"):
+                        continue
+                    title = r.get("title") or ""
+                    artist = r.get("artist") or ""
+                    composer = r.get("composer") or ""
+                    fname = (r.get("audio_path") or "").rsplit("/", 1)[-1]
+                    try:
+                        disp = styled_title(title, artist, composer)
+                        _primary, alias = aliases_for_row(
+                            {"title": title, "artist": artist, "composer": composer})
+                    except Exception:  # noqa: BLE001 — CSV must never die on metadata
+                        disp, alias = title, ()
+                    w.writerow((title, disp, artist, r.get("album") or "", composer,
+                                fname, r.get("license_name") or "", r.get("license_url") or "",
+                                r["ia_item"],
+                                f"https://archive.org/details/{r['ia_item']}",
+                                IaUploader.download_url(r["ia_item"], fname)))
+                    n += 1
+            os.replace(tmp, path)  # atomic — a killed session can never leave a half CSV
+            self.ledger.write_meta("hf_links_seq", str(seq))
+        except Exception as e:  # noqa: BLE001
+            print(f"[HF] links csv warn: {e!r} (rotation skipped this checkpoint)")
+        finally:
+            with_sfx = path.with_name(path.name + ".tmp")
+            if with_sfx.exists():
+                try:
+                    with_sfx.unlink()
+                except OSError:
+                    pass
+        print(f"[HF] links snapshot #{seq}: {n} archived track(s) -> {path.name}")
+        return path
 
     # ------------------------------------------------------------------ commit
     def sync(self, reason: str = "checkpoint", final: bool = False) -> bool:
@@ -288,6 +363,7 @@ geometry). `state/stats.json` carries live counters of the archiver run.
         self.write_manifest()
         self.write_stats()
         self.write_readme()
+        self.write_links_csv()
         from pathlib import Path as _P
         snap = self.cfg.data_dir / "state" / "msarchive.db"
         try:

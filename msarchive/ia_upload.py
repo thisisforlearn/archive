@@ -48,6 +48,9 @@ License : per-track (CC-BY / CC BY-SA / CC0 / ...): see ATTRIBUTION.csv
 Item    : {artist} — music collection (part {part}/{total})
 
 {alias_notes}
+
+DIRECT DOWNLOAD LINKS (one link per file; format: archive.org/download/<item>/<file>)
+{download_links}
 """
 
 
@@ -56,18 +59,85 @@ class IaUploader:
         self.cfg = cfg
         self.ledger = ledger
         self._session = None
+        self._csv_identifier = None  # set per item so ATTRIBUTION rows carry their URLs
 
     # -------------------------------------------------------------- session
     def session(self):
-        if self._session is None:
-            import internetarchive
-            kw = {}
-            if self.cfg.ia_access_key and self.cfg.ia_secret_key:
-                kw = {"access_key": self.cfg.ia_access_key, "secret_key": self.cfg.ia_secret_key}
-            elif (self.cfg.data_dir / "ia.keys").exists():
-                pass
-            self._session = internetarchive.get_session(**kw)
+        """Version-proof IA session.
+
+        internetarchive >= 5.0 accepts credentials ONLY via a config mapping
+        ({"s3": {"access": ..., "secret": ...}}); the access_key= kwargs were
+        removed long ago. We try the modern path, verify the keys actually
+        landed in the session, then fall back to the old kwargs form for
+        ancient installs. A live preflight against s3.us.archive.org follows
+        so bad keys fail loudly ONCE instead of 10k times in upload loops.
+        """
+        if self._session is not None:
+            return self._session
+        import internetarchive
+        from msarchive import __version__
+
+        sess = None
+        if self.cfg.ia_access_key and self.cfg.ia_secret_key:
+            cfgmap = {
+                "s3": {"access": self.cfg.ia_access_key, "secret": self.cfg.ia_secret_key},
+                "general": {"user_agent_suffix": f"msarchive/{__version__} ({__github__})"},
+            }
+            attempts = [
+                lambda: internetarchive.get_session(config=cfgmap),                       # modern (5.x)
+                lambda: internetarchive.get_session(                                      # legacy kwargs
+                    access_key=self.cfg.ia_access_key, secret_key=self.cfg.ia_secret_key),
+                lambda: internetarchive.session.ArchiveSession(config=cfgmap),            # belt & braces
+            ]
+            last_err = None
+            for make in attempts:
+                try:
+                    candidate = make()
+                except (TypeError, AttributeError, ImportError) as e:  # noqa: PERF203
+                    last_err = e
+                    continue
+                if str(getattr(candidate, "access_key", "") or "") == self.cfg.ia_access_key:
+                    sess = candidate
+                    break
+                last_err = candidate  # session built but keys did not stick
+            if sess is None:
+                raise RuntimeError(
+                    f"[IA] could not construct an authenticated session (tried 3 strategies): {last_err!r}"
+                )
+        else:
+            sess = internetarchive.get_session()  # env/file-driven installs
+            if not str(getattr(sess, "access_key", "") or ""):  # pragma: no cover
+                print("[IA] warning: no S3 keys in session — uploads will fail; "
+                      "set IA_S3_ACCESS_KEY / IA_S3_SECRET_KEY (or IA_ACCESS_KEY / IA_SECRET_KEY)")
+        self._validate_keys(sess)
+        self._session = sess
         return self._session
+
+    def _validate_keys(self, sess) -> bool:
+        """Cheap live preflight: GET s3.us.archive.org with the LOW auth header.
+
+        Valid keys -> 200; wrong keys -> 403 'Authentication failed'.
+        Caches the result so one session only tests once.
+        """
+        if getattr(self, "_keys_ok", False):
+            return True
+        auth = f"LOW {getattr(sess, 'access_key', '')}:{getattr(sess, 'secret_key', '')}"
+        if not sess.access_key:
+            return False
+        try:
+            r = sess.get("https://s3.us.archive.org/", headers={"Authorization": auth}, timeout=20)
+        except Exception as e:  # noqa: BLE001 — network flap: warn, do not kill the run
+            print(f"[IA] key preflight skipped ({e!r}); continuing and letting uploads retry")
+            self._keys_ok = True
+            return True
+        if r.status_code in (200, 204, 404):
+            print("[IA] key preflight OK")
+            self._keys_ok = True
+            return True
+        raise RuntimeError(
+            f"[IA] S3 keys REJECTED by archive.org (HTTP {r.status_code}). "
+            "Regenerate them at https://archive.org/account/s3.php and rerun."
+        )
 
     # ---------------------------------------------------------- item planning
     def identifier_for(self, artist_slug: str, part: int = 1) -> str:
@@ -89,13 +159,31 @@ class IaUploader:
         self.ledger.upsert_ia_items([(ident, aslug, n) for ident, aslug, n in out])
         return out
 
+    # ------------------------------------------------------ download links
+    LINKS_MAX = 400  # meta.xml stays lean; the full table always lives in ATTRIBUTION.csv
+
+    @staticmethod
+    def download_url(identifier: str, file_name: str) -> str:
+        """IA direct-download permalink; spaces/+/& are URI-encoded (%20 style)."""
+        from urllib.parse import quote as _q
+        return f"https://archive.org/download/{identifier}/{_q(file_name)}"
+
+    def _download_links(self, identifier: str, files: list) -> str:
+        lines = [self.download_url(identifier, str(Path(r["audio_path"]).name))
+                 for r in files[:self.LINKS_MAX]]
+        extra = len(files) - len(lines)
+        if extra > 0:
+            lines.append(f"... {extra} more — every file (including these) is listed "
+                         "with its URL, license and attribution in ATTRIBUTION.csv on this item")
+        return "\n".join(lines)
+
     # ---------------------------------------------------------------- upload
     def _attribution_csv(self, files: list) -> str:
         import csv
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(("file", "title", "display_title", "aliases", "artist", "album",
-                    "license", "license_url", "source_url",
+                    "license", "license_url", "source_url", "download_url",
                     "archiver", "archiver_email", "archiver_github"))
         for r in files:
             name = str(Path(r["audio_path"]).name)
@@ -105,6 +193,7 @@ class IaUploader:
                         " | ".join(alias[:8]),
                         r["artist"], r["album"], r["license_name"],
                         r["license_url"], r["source_url"],
+                        self.download_url(self._csv_identifier or "", name) if getattr(self, "_csv_identifier", None) else "",
                         self.cfg.archivist_name, self.cfg.archivist_email, self.cfg.archivist_github))
         return buf.getvalue()
 
@@ -131,11 +220,12 @@ class IaUploader:
             bar.update(1)
 
         with ThreadPoolExecutor(max_workers=self.cfg.ia_workers) as ex:
-            for fut in as_completed({ex.submit(work, p): p for p in todo}):
+            fmap = {ex.submit(work, p): p for p in todo}
+            for fut in as_completed(fmap):
                 try:
                     fut.result()
                 except Exception as e:  # noqa: BLE001
-                    print(f"[IA] item error {getattr(fut, '_ia_ident', '?')}: {e!r}")
+                    print(f"[IA] item error {fmap[fut][0]}: {e!r}")
         bar.close()
         fbar.close()
 
@@ -161,6 +251,7 @@ class IaUploader:
             return
 
         self.ledger.set_ia_status(identifier, "UPLOADING", None, None)
+        self._csv_identifier = identifier
         attrib = self._attribution_csv(pending)
         alias_subject = item_alias_subject(pending)
         alias_notes = alias_description_notes(pending)
@@ -178,6 +269,7 @@ class IaUploader:
                 part=identifier.rsplit("-p", 1)[-1] if "-p" in identifier else "1",
                 total="multi",
                 alias_notes=alias_notes,
+                download_links=self._download_links(identifier, pending),
             ),
             "subject": ["music", "free music archive", "creative commons", "open music",
                         "vaibhav agarwal", "archiver", "thisisforlearn", *alias_subject],
@@ -207,13 +299,19 @@ class IaUploader:
             if bad := [c for c in codes if c not in (200, 201)]:
                 self.ledger.set_ia_status(identifier, STATUS_FAILED, None, f"status={bad}")
                 return
-            # provenance sidecar, uploaded after audio so item references resolve
+            # provenance sidecar, uploaded after audio so item references resolve.
+            # Read from disk (name->path dict); streaming BytesIO dict values are
+            # NOT reliably ingested by IA S3 (200-but-NeverNoSuchKey observed).
+            tmpdir = self.cfg.data_dir / "tmp"
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            csv_path = tmpdir / f"ATTRIBUTION-{identifier}.csv"
+            csv_path.write_text(attrib, encoding="utf-8")
             item.upload(
-                files={"ATTRIBUTION.csv": io.BytesIO(attrib.encode("utf-8"))},
+                files={"ATTRIBUTION.csv": str(csv_path)},
                 metadata={}, checksum=False, retries=3, retries_sleep=10,
                 verbose=False, queue_derive=False,
             )
-            self.ledger.mark_track_ia([rr["track_key"] for rr in pending])
+            self.ledger.mark_track_ia([rr["track_key"] for rr in pending], identifier)
             self.ledger.set_ia_status(identifier, STATUS_UPLOADED_IA, len(pending))
             fbar.update(len(pending))
         except Exception as e:  # noqa: BLE001
