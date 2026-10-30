@@ -45,6 +45,9 @@ class HfMirror:
         self._api = None
         self._tree: dict[str, dict] = {}
         self._tree_ts: float = 0.0
+        # Resolved mirror repo id: starts from cfg, may auto-switch to the
+        # token's own namespace if the configured namespace isn't accessible.
+        self.repo_id: str = cfg.hf_repo_id
 
     @property
     def token(self) -> str | None:
@@ -63,20 +66,54 @@ class HfMirror:
             return False
         return True
 
-    def ensure_repo(self, private: bool = False) -> None:
-        from huggingface_hub.errors import HfHubHTTPError
+    def whoami(self) -> str:
         try:
-            self.api().create_repo(self.cfg.hf_repo_id, repo_type="dataset", private=private, exist_ok=True)
-        except HfHubHTTPError as e:
-            if e.response.status_code not in (404, 403):
-                raise
-            print(f"[HF] cannot create {self.cfg.hf_repo_id} ({e.response.status_code}) — "
-                  "give the fine-grained token write access to the dataset repo/owner.")
-            raise
+            return str(self.api().whoami()["name"] or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _repo_leaf(repo_id: str) -> str:
+        return repo_id.split("/", 1)[-1] or "vaibhav-music-archive"
+
+    def ensure_repo(self, private: bool = False) -> None:
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        api = self.api()
+        me = self.whoami()
+        if me:
+            print(f"[HF] logged in as '{me}'")
+        ns = self.repo_id.split("/", 1)[0] if "/" in self.repo_id else self.repo_id
+        if me and ns and ns != me:
+            # Keep the configured namespace ONLY if the repo already exists there and
+            # the token can see it (e.g. an org you belong to); otherwise switch to the
+            # logged-in user's own namespace — avoids the known HF 403 dead-end
+            # ("You don't have the rights to create a dataset under the namespace ...").
+            known = False
+            try:
+                api.repo_info(self.repo_id, repo_type="dataset")
+                known = True
+            except RepositoryNotFoundError:
+                known = False  # repo genuinely absent under the other namespace
+            except Exception as e:  # noqa: BLE001
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                known = status != 404  # gated/private/flap — don't switch on guesswork
+            if not known:
+                new_id = f"{me}/{self._repo_leaf(self.repo_id)}"
+                print(f"[HF] token is '{me}' and {self.repo_id} is not yours/absent — "
+                      f"using {new_id} (override with MSARCHIVE_HF_REPO_ID)")
+                self.repo_id = new_id
+        # exist_ok=True: NEVER touches repo contents — creation is a no-op if the
+        # repo already exists; nothing is ever deleted or reset here.
+        api.create_repo(self.repo_id, repo_type="dataset", private=private, exist_ok=True)
+        try:
+            self.ledger.write_meta("hf_mirror_repo", self.repo_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     def refresh_tree(self) -> dict[str, dict]:
         tree = {}
-        for f in self.api().list_repo_tree(self.cfg.hf_repo_id, repo_type="dataset",
+        for f in self.api().list_repo_tree(self.repo_id, repo_type="dataset",
                                            path_in_repo="", recursive=True):
             name = getattr(f, "path", None) or getattr(f, "rpath", None)
             if not name:
@@ -101,14 +138,15 @@ class HfMirror:
         tmp.mkdir(parents=True, exist_ok=True)
         try:
             local = hf_hub_download(
-                repo_id=self.cfg.hf_repo_id, repo_type="dataset",
+                repo_id=self.repo_id, repo_type="dataset",
                 filename="state/msarchive.db", local_dir=str(tmp),
                 force_download=False, token=self.token,
             )
             self.ledger.merge_from(Path(local))
-            print(f"[HF] merged ledger snapshot from {self.cfg.hf_repo_id}")
+            print(f"[HF] merged ledger snapshot from {self.repo_id}")
         except RepositoryNotFoundError:
-            print("[HF] no prior ledger on the Hub; starting a fresh archive")
+            print("[HF] no prior ledger on the Hub — starting a fresh archive "
+                  "(any existing repo files stay untouched; nothing is deleted)")
             self.ensure_repo()
             return
         except Exception as e:  # noqa: BLE001
@@ -135,7 +173,7 @@ class HfMirror:
         for tk, rel in tqdm(todo, desc="HF restore", unit="file"):
             try:
                 hf_hub_download(
-                    repo_id=self.cfg.hf_repo_id, repo_type="dataset",
+                    repo_id=self.repo_id, repo_type="dataset",
                     filename=rel, local_dir=str(self.cfg.data_dir), token=self.token,
                 )
                 self.ledger.mark_downloaded(tk, rel, int(tree[rel]["size"]), "", "")
@@ -260,14 +298,18 @@ geometry). `state/stats.json` carries live counters of the archiver run.
         from huggingface_hub import upload_folder
         from huggingface_hub.utils import HfHubHTTPError
         n_before = self.ledger.stats().get("audio_bytes", 0)
+        # SAFETY: upload_folder NEVER deletes remote files unless delete_patterns is
+        # passed (Hub docs). We pass none — every checkpoint only adds/overwrites,
+        # so audio already mirrored in the repo is preserved across sessions.
         try:
             upload_folder(
                 folder_path=str(self.cfg.data_dir),
-                repo_id=self.cfg.hf_repo_id,
+                repo_id=self.repo_id,
                 repo_type="dataset",
                 commit_message=f"{reason}: {self.cfg.archivist_name} <{self.cfg.archivist_email}> ({__github__})",
                 ignore_patterns=IGNORE,
                 token=self.token,
+                delete_patterns=None,  # explicit: never remove existing repo files
             )
         except HfHubHTTPError as e:
             print(f"[HF] upload_folder failed: {e}")
@@ -278,9 +320,10 @@ geometry). `state/stats.json` carries live counters of the archiver run.
             try:
                 upload_folder(
                     folder_path=str(self.cfg.data_dir),
-                    repo_id=self.cfg.hf_repo_id, repo_type="dataset",
+                    repo_id=self.repo_id, repo_type="dataset",
                     commit_message=f"{reason} (retry): {self.cfg.archivist_name}",
                     ignore_patterns=IGNORE, token=self.token,
+                    delete_patterns=None,  # never remove existing repo files
                 )
             except Exception as e2:  # noqa: BLE001
                 print(f"[HF] retry failed: {e2!r}")
