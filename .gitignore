@@ -1,0 +1,30 @@
+# Git metadata + example config are like a one-off project structure — but the secrets
+# NEVER go in.
+#
+# Privacy first
+.env
+*.key
+*.keys
+ia.keys
+*.secret
+
+# msarchive state
+data/
+kaggle_tmp/
+*.part
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# White spaces from local tests
+test_tmp/
+tmp/

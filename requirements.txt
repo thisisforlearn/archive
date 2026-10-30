@@ -1,0 +1,11 @@
+# msarchive runtime requirements (GPL-3.0-only project)
+# Author: Vaibhav (Vaibhav Agarwal, archiver) <nekomeowpurr@proton.me>
+# https://github.com/thisisforlearn/archive
+python-dotenv>=1.2
+orjson>=3.10
+psutil>=6.0
+pyarrow>=18
+tqdm>=4.66
+huggingface_hub[hf_xet]>=1.0
+internetarchive>=5.0
+requests>=2.31
