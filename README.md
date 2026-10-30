@@ -43,14 +43,17 @@ searches hit the right file.
 ## Usage
 
 ```bash
-./scripts/setup.sh                       # venv at ~/ml_env + requirements (local rule: no system installs)
-cp .env.example .env                     # fill IA_S3_* + HF_TOKEN
-source ~/ml_env/bin/activate
-python -m msarchive run --max-hours 8    # full pipeline, resumable at any point
+git clone https://github.com/thisisforlearn/archive && cd archive
+./run.sh                # asks for your 3 free keys once (saved to .env), then archiving
 ```
 
-Commands: `run` · `scan` · `extract` · `upload-ia` · `checkpoint [--final]` · `restore` · `stats`.
-Policies: `--policy permissive|strict|flags|all` (default name-based `permissive`).
+That single command does everything: venv at `~/ml_env` (never system-wide),
+deps, co-authoring hooks, key prompts, then the full resumable pipeline.
+After the first run it's `./run.sh` anytime — everything resumes from the HF
+ledger. Key budget: `MAX_HOURS=8 ./run.sh` · extra flags: `./run.sh run --max-hours 8 --limit-shards 50`.
+
+Details: `./run.sh stats` · `./run.sh checkpoint` · `./run.sh restore` ·
+policies `--policy permissive|strict|flags|all`.
 
 **Kaggle**: import `notebooks/kaggle_runner.ipynb`, add the three Secrets
 (`IA_S3_ACCESS_KEY`, `IA_S3_SECRET_KEY`, `HF_TOKEN`), Internet ON, run for 12 h —
