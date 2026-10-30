@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# prepare-commit-msg — auto-append Co-authored-by on every commit (idempotent).
+# Author: Vaibhav (Vaibhav Agarwal, archiver) <nekomeowpurr@proton.me>
+# GitHub: https://github.com/thisisforlearn/archive | GPL-3.0-only
+set -euo pipefail
+
+TRAILER="Co-authored-by: thisisforlearn <247012990+thisisforlearn@users.noreply.github.com>"
+
+msg_file="$1"
+commit_source="${2:-}"   # message | template | merge | squash | ""
+
+# never touch merge/squash/flight autosquash-created messages
+[ "$commit_source" = "merge" ] || [ "$commit_source" = "squash" ] && exit 0
+# only add to commits that have a real message (skip FIXUP scaffolds)
+case "$msg_file" in
+  *FIXUP*|*TAG*) exit 0 ;;
+esac
+
+grep -qi '^Co-authored-by: thisisforlearn' "$msg_file" && exit 0
+
+# strip comment block once, append trailer after a blank line
+{ awk '/^#/{exit} {print}' "$msg_file"; echo; echo "$TRAILER"; } > "$msg_file.new"
+mv "$msg_file.new" "$msg_file"
+exit 0

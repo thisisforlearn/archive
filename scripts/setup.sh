@@ -17,5 +17,10 @@ python -m pip install --upgrade pip >/dev/null
 pip install -r requirements.txt
 
 cp -n .env.example .env 2>/dev/null || true
+
+# Attribute every commit to both accounts (Vaibhav author + thisisforlearn co-author)
+git config --local core.hooksPath hooks
+git config --local commit.template .commit-template
+echo "[setup] commit co-authoring wired (hooks/prepare-commit-msg + template)"
 echo "[setup] done. Remember to fill .env (IA + HF keys), then run:"
 echo "        source ~/ml_env/bin/activate && python -m msarchive run --max-hours 8"

@@ -1,0 +1,8 @@
+# Default commit message template for msarchive.
+# Author: Vaibhav (Vaibhav Agarwal, archiver) <nekomeowpurr@proton.me>
+# https://github.com/thisisforlearn/archive | GPL-3.0-only
+#
+# Subject under ~72 chars. Keep the Co-authored-by line at the very bottom so
+# GitHub attributes both accounts on the repo.
+
+#Co-authored-by: thisisforlearn <247012990+thisisforlearn@users.noreply.github.com>
