@@ -105,11 +105,46 @@ class HfMirror:
                 self.repo_id = new_id
         # exist_ok=True: NEVER touches repo contents — creation is a no-op if the
         # repo already exists; nothing is ever deleted or reset here.
-        api.create_repo(self.repo_id, repo_type="dataset", private=private, exist_ok=True)
         try:
-            self.ledger.write_meta("hf_mirror_repo", self.repo_id)
-        except Exception:  # noqa: BLE001
-            pass
+            api.create_repo(self.repo_id, repo_type="dataset", private=private, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"could not create/verify dataset {self.repo_id} ({e!r}). If this is a "
+                "401/403, your HF token lacks WRITE permission — make a token with "
+                "'write' scope at https://huggingface.co/settings/tokens and update "
+                "the HF_TOKEN secret in Kaggle."
+            ) from e
+        self._write_probe(api)
+
+    def _write_probe(self, api) -> None:
+        """One-upload write-permission proof at session start.
+
+        A read-only token can whoami+create_repo(exist_ok) yet still fail EVERY
+        upload_folder 1h later, leaving checkpoints dead for the whole session
+        (exactly the failure the previous Kaggle run hit). Uploading a tiny
+        marker proves write access NOW; if it fails the message names the fix.
+        """
+        from huggingface_hub import CommitOperationAdd
+        if getattr(self, "_probed", False):
+            return
+        marker = f"ok {__version__} {time.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+        op = CommitOperationAdd(
+            path_in_repo="_msarchive-write-probe.txt",
+            path_or_fileobj=marker.encode("utf-8"),
+        )
+        try:
+            api.create_commit(
+                self.repo_id, repo_type="dataset", operations=[op],
+                commit_message="write-permission probe (msarchive)",
+            )
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"HF token CANNOT write to {self.repo_id} ({e!r}). Fix: create a token "
+                "with 'write' scope at https://huggingface.co/settings/tokens and put "
+                "it in the HF_TOKEN Kaggle secret."
+            ) from e
+        self._probed = True
+        print("[HF] write-probe OK — real checkpoints will land")
 
     def refresh_tree(self) -> dict[str, dict]:
         tree = {}

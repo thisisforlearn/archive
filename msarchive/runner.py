@@ -123,8 +123,8 @@ class CheckpointThread(threading.Thread):
         with self.lock:
             try:
                 self.hf.sync(why if why != self.reason else self.reason)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 — never silent:
+                print(f"[HF] checkpoint {why} FAILED: {e!r}", flush=True)  # a dead checkpoint thread must be loud
 
     def stop(self) -> None:
         self._stop.set()
@@ -175,6 +175,14 @@ def run_all(cfg, source_name: str | None = None, max_hours: float | None = None,
         signal.signal(signal.SIGINT, _sig)
 
     hf.restore()  # resume progress + fetch pre-archived audio from the mirror
+
+    # IMMEDIATE first commit: proves the JWT/creds/repo are writable in the first
+    # minutes (probe + folder upload), instead of discovering a broken checkpoint
+    # thread one hour into a Kaggle session. Future sessions can then restore().
+    try:
+        hf.sync("startup")
+    except Exception as e:  # noqa: BLE001 — loud, then keep going; hourly will retry
+        print(f"[HF] startup checkpoint FAILED (hourly will retry): {e!r}", flush=True)
 
     def extract_loop() -> None:
         """Cycles: scan → extract pass, until stopped or out of budget."""
